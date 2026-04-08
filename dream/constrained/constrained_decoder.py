@@ -57,6 +57,143 @@ class ConstrainedDecoder:
         # Pre-filter to non-empty byte sequences
         self._nonempty_t2b = {tid: b for tid, b in token_to_bytes.items() if b}
 
+        # Precompute mask of tokens with empty bytes (special/meta tokens).
+        # These can never be valid JSON content — reject them at the logit level.
+        self._empty_byte_token_ids = frozenset(
+            tid for tid, b in token_to_bytes.items() if not b
+        )
+
+    def get_empty_byte_mask(self, vocab_size: int, device: torch.device) -> torch.Tensor:
+        """
+        Returns a boolean mask where True = token should be blocked.
+        Blocks both:
+        - Tokens with empty bytes in t2b (special tokens within tokenizer vocab)
+        - Tokens with IDs >= len(t2b) (padding tokens beyond tokenizer vocab)
+        Apply as: logits[:, mask] = -inf
+        """
+        if not hasattr(self, '_empty_byte_mask_cache'):
+            self._empty_byte_mask_cache = {}
+        cache_key = (vocab_size, device)
+        if cache_key not in self._empty_byte_mask_cache:
+            mask = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+            # Block tokens explicitly mapped to empty bytes
+            for tid in self._empty_byte_token_ids:
+                if tid < vocab_size:
+                    mask[tid] = True
+            # Block tokens beyond the tokenizer's vocabulary
+            # (padding in the embedding layer, no byte representation)
+            max_known_tid = max(self.t2b.keys()) if self.t2b else 0
+            if vocab_size > max_known_tid + 1:
+                mask[max_known_tid + 1:] = True
+            # Also block the mask token itself
+            if self.mask_token_id < vocab_size:
+                mask[self.mask_token_id] = True
+            self._empty_byte_mask_cache[cache_key] = mask
+        return self._empty_byte_mask_cache[cache_key]
+
+    # ------------------------------------------------------------------
+    # Force-close: compute minimal byte sequence to reach accept state
+    # ------------------------------------------------------------------
+
+    def compute_closing_bytes(self) -> Optional[bytes]:
+        """
+        Find the shortest byte sequence that drives the DFA from the
+        main segment's exit state to an accept state.
+
+        Returns None if already in accept state or no path exists.
+        Uses BFS over DFA states.
+        """
+        # Find the main segment (the one starting at or before gen_start)
+        main_seg = None
+        for seg in self.mgr._segments:
+            if seg.start <= self.mgr.gen_start:
+                main_seg = seg
+                break
+        if main_seg is None and self.mgr._segments:
+            # Use the first segment
+            main_seg = self.mgr._segments[0]
+        if main_seg is None:
+            return None
+
+        # Get exit states filtered by start_state entry
+        if main_seg.start <= self.mgr.gen_start:
+            exit_states = frozenset(
+                x for e, x in main_seg.pairs if e == self.dfa.start_state
+            )
+        else:
+            exit_states = main_seg.exit_states()
+
+        if not exit_states:
+            return None
+
+        # Check if any exit state is already an accept state
+        for s in exit_states:
+            if s in self.dfa.accept_states:
+                return b''  # already valid
+
+        # BFS: find shortest byte path from any exit state to any accept state
+        from collections import deque
+        # State: (dfa_state, bytes_so_far)
+        queue = deque()
+        visited = set()
+        for s in exit_states:
+            queue.append((s, b''))
+            visited.add(s)
+
+        while queue:
+            state, path = queue.popleft()
+            if len(path) > 20:
+                # Safety limit — don't search forever
+                break
+
+            for byte_val in range(256):
+                next_state = self.dfa.forward[state][byte_val]
+                if next_state == DEAD or next_state in visited:
+                    continue
+                new_path = path + bytes([byte_val])
+                if next_state in self.dfa.accept_states:
+                    return new_path
+                visited.add(next_state)
+                queue.append((next_state, new_path))
+
+        return None  # no path found
+
+    def find_closing_tokens(self) -> list[int]:
+        """
+        Find token IDs that could close the JSON from current state.
+
+        Returns a list of token IDs to append, or empty list if
+        no closing sequence found.
+        """
+        closing_bytes = self.compute_closing_bytes()
+        if closing_bytes is None or closing_bytes == b'':
+            return []
+
+        # Find tokens whose bytes match prefixes of closing_bytes
+        # Greedy: find the longest token that matches a prefix
+        result = []
+        remaining = closing_bytes
+        while remaining:
+            best_tid = None
+            best_len = 0
+            for tid, tok_bytes in self._nonempty_t2b.items():
+                if remaining.startswith(tok_bytes) and len(tok_bytes) > best_len:
+                    best_tid = tid
+                    best_len = len(tok_bytes)
+            if best_tid is None:
+                # No token matches — try single-byte tokens
+                byte_val = remaining[0]
+                for tid, tok_bytes in self._nonempty_t2b.items():
+                    if tok_bytes == bytes([byte_val]):
+                        best_tid = tid
+                        best_len = 1
+                        break
+            if best_tid is None:
+                break  # can't find a matching token
+            result.append(best_tid)
+            remaining = remaining[best_len:]
+        return result
+
     # ------------------------------------------------------------------
     # Segment lookup helpers (return Segment, not index — avoids stale indices)
     # ------------------------------------------------------------------
@@ -143,7 +280,7 @@ class ConstrainedDecoder:
         left_seg = self._seg_ending_at(position - 1)
         left_is_start = (position == self.mgr.gen_start)
         if not (left_seg is not None or left_is_start):
-            return True
+            return True  # unconstrained
 
         right_seg = self._seg_starting_at(position + 1)
         right_is_end = (position == self.mgr.gen_end)
@@ -151,9 +288,20 @@ class ConstrainedDecoder:
         effective_right = right_entries if right_tight else None
 
         token_bytes = self.t2b.get(token_id, b'')
-        if not token_bytes:
-            return False
 
+        # EOS/empty-byte token: valid iff the current DFA state is accepting.
+        # This means the JSON is syntactically complete at this point.
+        # All positions after this will also see an accept state and allow EOS.
+        if not token_bytes:
+            # EOS is valid when any left exit state is an accept state
+            # AND (if right is constrained) the accept state is compatible
+            for q in left_exits:
+                if q in self.dfa.accept_states:
+                    if effective_right is None or q in effective_right:
+                        return True
+            return False  # JSON not complete — EOS rejected
+
+        # Normal byte-bearing token
         for q in left_exits:
             result = self.dfa.transition_seq(q, token_bytes)
             if result != DEAD:
@@ -255,13 +403,33 @@ class ConstrainedDecoder:
         right_tight = right_seg is not None or right_is_end
         effective_right = right_entries if right_tight else None
 
+        # Check if EOS should be allowed (any left exit is an accept state)
+        eos_allowed = any(q in self.dfa.accept_states for q in left_exits)
+        if eos_allowed and effective_right is not None:
+            # Also need accept state to be in right entries
+            eos_allowed = any(
+                q in self.dfa.accept_states and q in effective_right
+                for q in left_exits
+            )
+
+        def _mark_eos_valid(mask):
+            """If EOS is allowed, add all EOS-like token IDs to valid set."""
+            if not eos_allowed:
+                return mask
+            for tid in self._empty_byte_token_ids:
+                if tid < mask.shape[0]:
+                    mask[tid] = True
+            max_known = max(self.t2b.keys()) if self.t2b else 0
+            if mask.shape[0] > max_known + 1:
+                mask[max_known + 1:] = True
+            if self.mask_token_id < mask.shape[0]:
+                mask[self.mask_token_id] = True
+            return mask
+
         # -----------------------------------------------------------
-        # FAST PATH: use precomputed per-state masks (works for ANY
-        # number of left exit states, not just 1)
+        # FAST PATH: use precomputed per-state masks
         # -----------------------------------------------------------
         if effective_right is None and self._state_mask_cache:
-            # Union of precomputed masks for all left exit states.
-            # Each mask lookup is O(1); OR is O(vocab_size) but on GPU.
             mask = None
             for state in left_exits:
                 state_mask = self._get_precomputed_state_mask(
@@ -272,22 +440,15 @@ class ConstrainedDecoder:
                 else:
                     mask.logical_or_(state_mask)
             if mask is not None:
+                mask = _mark_eos_valid(mask)
                 self._mask_cache[position] = mask
                 return mask
 
         # -----------------------------------------------------------
         # RIGHT-CONSTRAINED PATH: need to intersect with right entries.
-        # If few left exits, do it via precomputed masks + filtering.
+        # Only feasible with small exit state sets.
         # -----------------------------------------------------------
-        if effective_right is not None and len(left_exits) <= 20 and self._state_mask_cache:
-            # For each left exit state, find which tokens lead to a
-            # right entry state. We can do this by checking each token
-            # in the union mask against the DFA, which is cheaper than
-            # the full trie when the union mask is small-ish.
-            # But if left_exits is large, fall through to trie.
-            #
-            # Actually, the most efficient approach: use precomputed masks
-            # to get the candidate set, then filter by right constraint.
+        if effective_right is not None and len(left_exits) <= 10 and self._state_mask_cache:
             union_mask = None
             for state in left_exits:
                 state_mask = self._get_precomputed_state_mask(
@@ -299,8 +460,6 @@ class ConstrainedDecoder:
                     union_mask.logical_or_(state_mask)
 
             if union_mask is not None:
-                # Filter: for each candidate token, check if any left exit
-                # state transitions through it to a right entry state.
                 candidate_indices = union_mask.nonzero(as_tuple=True)[0]
                 size = max(self.trie.vocab_size, logits_vocab_size)
                 mask = torch.zeros(size, dtype=torch.bool, device=device)
@@ -316,6 +475,26 @@ class ConstrainedDecoder:
                             mask[tid] = True
                             break
 
+                mask = _mark_eos_valid(mask)
+                self._mask_cache[position] = mask
+                return mask
+
+        # -----------------------------------------------------------
+        # LARGE EXIT SET WITH RIGHT CONSTRAINT: use union mask as
+        # over-approximation (skip right filtering for speed)
+        # -----------------------------------------------------------
+        if effective_right is not None and len(left_exits) > 10 and self._state_mask_cache:
+            mask = None
+            for state in left_exits:
+                state_mask = self._get_precomputed_state_mask(
+                    state, device, logits_vocab_size
+                )
+                if mask is None:
+                    mask = state_mask.clone()
+                else:
+                    mask.logical_or_(state_mask)
+            if mask is not None:
+                mask = _mark_eos_valid(mask)
                 self._mask_cache[position] = mask
                 return mask
 
@@ -328,6 +507,7 @@ class ConstrainedDecoder:
         if valid_set:
             indices = torch.tensor(list(valid_set), dtype=torch.long, device=device)
             mask[indices] = True
+        mask = _mark_eos_valid(mask)
         self._mask_cache[position] = mask
         return mask
 

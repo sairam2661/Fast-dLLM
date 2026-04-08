@@ -64,39 +64,30 @@ class SegmentManager:
 		self._end_to_idx: dict[int, int] = {} 
 		self._start_to_idx: dict[int, int] = {} 
 
-	@property
-	def num_segments(self) -> int:
-		return len(self._segments)
+	def reset(self):
+		"""Clear all state for a new generation. Must be called between instances."""
+		self._segments.clear()
+		self.committed.clear()
+		self._end_to_idx.clear()
+		self._start_to_idx.clear()
+
+
 
 	@property
-	def num_committed(self) -> int:
-		return len(self.committed)
-
+	def num_segments(self): return len(self._segments)
 	@property
-	def num_masked(self) -> int:
-		return self.gen_length - len(self.committed)
-
+	def num_committed(self): return len(self.committed)
+	@property
+	def num_masked(self): return self.gen_length - len(self.committed)
+ 
 	def get_segments(self) -> list[Segment]:
-		"""Return a copy of the segment list."""
 		return list(self._segments)
 
-	# ------------------------------------------------------------------
-	# Segment lookup (linear scan — segments list is small)
-	# ------------------------------------------------------------------
-
-	def _find_seg_ending_at(self, pos: int) -> Optional[int]:
-		"""Index of segment whose end == pos, or None."""
-		for i, seg in enumerate(self._segments):
-			if seg.end == pos:
-				return i
-		return None
-
-	def _find_seg_starting_at(self, pos: int) -> Optional[int]:
-		"""Index of segment whose start == pos, or None."""
-		for i, seg in enumerate(self._segments):
-			if seg.start == pos:
-				return i
-		return None
+	def _find_seg_ending_at(self, pos):
+		return self._end_to_idx.get(pos)
+ 
+	def _find_seg_starting_at(self, pos):
+		return self._start_to_idx.get(pos)	
 
 	def _insert_segment(self, seg: Segment):
 		"""Insert segment maintaining sorted order by start position."""
@@ -134,13 +125,13 @@ class SegmentManager:
 	def reveal_token(self, position, token_id):
 		assert position not in self.committed
 		assert self.gen_start <= position <= self.gen_end
-
+ 
 		token_bytes = self.token_to_bytes(token_id)
 		self.committed[position] = token_id
-
+ 
 		left_idx = self._end_to_idx.get(position - 1)
 		right_idx = self._start_to_idx.get(position + 1)
-
+ 
 		if left_idx is None and right_idx is None:
 			seg = create(position, token_bytes, self.dfa)
 			self._insert_segment(seg)
@@ -158,9 +149,10 @@ class SegmentManager:
 			seg = merge_with_bridge(left_seg, position, token_bytes, right_seg, self.dfa)
 			self._remove_indices(left_idx, right_idx)
 			self._insert_segment(seg)
-
+ 
 		self._rebuild_index()
-	# ------------------------------------------------------------------
+ 
+ 	# ------------------------------------------------------------------
 	# Valid token queries
 	# ------------------------------------------------------------------
 
@@ -220,48 +212,24 @@ class SegmentManager:
 				return True
 		return False
 
-	def _left_exit_states(self, position: int) -> frozenset[int]:
-		"""
-		DFA states that could be active just before `position`.
-
-		- If a segment ends at position-1: its exit states, filtered
-		  by the gen_start constraint if the segment starts at gen_start.
-		- If position is the start of generation: {dfa.start_state}.
-		- Otherwise (gap to the left): all states (over-approximation).
-		"""
+	def _left_exit_states(self, position):
 		idx = self._find_seg_ending_at(position - 1)
 		if idx is not None:
 			seg = self._segments[idx]
 			if seg.start <= self.gen_start:
-				# This segment covers gen_start, so its entry must be
-				# start_state. Filter pairs accordingly.
-				return frozenset(
-					x for e, x in seg.pairs if e == self.dfa.start_state
-				)
+				return frozenset(x for e, x in seg.pairs if e == self.dfa.start_state)
 			return seg.exit_states()
 		elif position == self.gen_start:
 			return frozenset({self.dfa.start_state})
 		else:
 			return frozenset(range(self.dfa.num_states))
-
-	def _right_entry_states(self, position: int) -> frozenset[int]:
-		"""
-		DFA states required as entry by the right context at `position`.
-
-		- If a segment starts at position+1: its entry states, filtered
-		  by the gen_end constraint if the segment ends at gen_end.
-		- If position is the end of generation: accept states.
-		- Otherwise (gap to the right): all states (over-approximation).
-		"""
+ 
+	def _right_entry_states(self, position):
 		idx = self._find_seg_starting_at(position + 1)
 		if idx is not None:
 			seg = self._segments[idx]
 			if seg.end >= self.gen_end:
-				# This segment covers gen_end, so its exit must be an
-				# accept state. Filter pairs accordingly.
-				return frozenset(
-					e for e, x in seg.pairs if x in self.dfa.accept_states
-				)
+				return frozenset(e for e, x in seg.pairs if x in self.dfa.accept_states)
 			return seg.entry_states()
 		elif position == self.gen_end:
 			return self.dfa.accept_states

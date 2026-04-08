@@ -337,8 +337,15 @@ class DreamGenerationMixin:
             first_token = x0[0, current_block_start].item()
             x[:, current_block_start] = first_token
 
-            if _cd is not None and first_token != mask_token_id:
-                _cd.commit_token(current_block_start, first_token)
+            # Only commit if the first token has actual bytes (not EOS/padding)
+            if _cd is not None:
+                first_bytes = _cd.t2b.get(first_token, b'')
+                if first_token != mask_token_id and first_bytes:
+                    _cd.commit_token(current_block_start, first_token)
+                elif not first_bytes:
+                    # EOS at block start — model wants to end here.
+                    # Revert to mask so it doesn't pollute the sequence.
+                    x[:, current_block_start] = mask_token_id
 
             if not dual_cache:
                 new_past_key_values = []
@@ -421,6 +428,7 @@ class DreamGenerationMixin:
                     mask_index[:, block_length:] = False
 
                     mask_logits = logits[mask_index]
+
                     confidence, x0 = sample_tokens(mask_logits, temperature, top_p=top_p, top_k=top_k, neg_entropy=True)
                     num_mask_token = mask_index.sum() / mask_index.shape[0]
                     number_transfer_tokens = int(num_mask_token * (1 - s / t_val)) if i < steps_per_block - 1 else int(num_mask_token)
@@ -448,65 +456,163 @@ class DreamGenerationMixin:
 
                         if _cd is not None:
                             # ============================================
-                            # OPTIMIZED SEQUENTIAL COMMIT
+                            # FRONTIER-PRIORITY CONSTRAINED COMMIT
                             # ============================================
                             t_cd_start = time.time()
                             num_committed_step = 0
-                            num_rejected = 0
+                            num_constrained = 0
+                            num_resampled = 0
                             num_unconstrained = 0
-                            rejection_details = []
+                            num_frontier = 0
 
-                            for k in range(number_transfer_tokens):
-                                b_pos = transfer_index[0, k].item()
-                                seq_pos = current_block_start + b_pos
-                                proposed_token = x_[0, b_pos].item()
-
-                                if proposed_token == mask_token_id:
-                                    continue
-
-                                # Check if this position is actually constrained
-                                left_seg = _cd._seg_ending_at(seq_pos - 1)
-                                left_is_start = (seq_pos == _cd.mgr.gen_start)
-                                is_constrained = left_seg is not None or left_is_start
-
-                                if _cd.is_valid_at_position(seq_pos, proposed_token):
-                                    x[0, seq_pos] = proposed_token
-                                    _cd.commit_token(seq_pos, proposed_token)
-                                    num_committed_step += 1
-                                    if not is_constrained:
-                                        num_unconstrained += 1
+                            # === PHASE 1: Frontier-priority commitment ===
+                            # Grow the main segment rightward, AR-style.
+                            # The frontier has a single DFA exit state, giving
+                            # tight constraints identical to AR decoding.
+                            frontier_budget = number_transfer_tokens
+                            while frontier_budget > 0:
+                                # Find main segment (the one starting at gen_start)
+                                main_idx = _cd.mgr._find_seg_starting_at(_cd.mgr.gen_start)
+                                if main_idx is not None:
+                                    main_seg = _cd.mgr._segments[main_idx]
+                                    frontier_pos = main_seg.end + 1
                                 else:
-                                    num_rejected += 1
-                                    # Log first few rejections per step
-                                    if len(rejection_details) < 3:
-                                        diag = _cd.diagnose_rejection(seq_pos, proposed_token)
-                                        rejection_details.append(diag)
+                                    frontier_pos = _cd.mgr.gen_start
+
+                                # Stop if frontier is past generation region
+                                if frontier_pos > _cd.mgr.gen_end:
+                                    break
+                                # Stop if frontier already committed
+                                if frontier_pos in _cd.mgr.committed:
+                                    # Frontier might have been committed by a previous
+                                    # block/step. Advance past it by re-looping — the
+                                    # main segment will have absorbed it.
+                                    break
+                                # Stop if frontier position isn't masked
+                                if x[0, frontier_pos].item() != mask_token_id:
+                                    break
+
+                                # Compute position within logits tensor
+                                if dual_cache:
+                                    b_pos = frontier_pos - current_block_start
+                                else:
+                                    b_pos = frontier_pos - current_block_start
+                                # Stop if frontier is outside current logits window
+                                if b_pos < 0 or b_pos >= logits.shape[1]:
+                                    break
+
+                                # Get constrained valid mask at frontier
+                                valid_mask = _cd.get_valid_mask(
+                                    frontier_pos, logits.device,
+                                    logits_vocab_size=logits.shape[-1]
+                                )
+
+                                pos_logits = logits[0, b_pos].clone()
+                                if valid_mask is not None and valid_mask.any():
+                                    pos_logits[~valid_mask] = float('-inf')
+
+                                # Sample from constrained logits
+                                if temperature > 0:
+                                    probs = torch.softmax(pos_logits / temperature, dim=-1)
+                                    chosen_token = torch.multinomial(probs, 1).item()
+                                else:
+                                    chosen_token = pos_logits.argmax().item()
+
+                                chosen_bytes = _cd.t2b.get(chosen_token, b'')
+                                if chosen_bytes:
+                                    # Real token — commit and extend frontier
+                                    x[0, frontier_pos] = chosen_token
+                                    _cd.commit_token(frontier_pos, chosen_token)
+                                    num_frontier += 1
+                                    num_committed_step += 1
+                                    frontier_budget -= 1
+                                else:
+                                    # EOS/empty-bytes token. If it survived the valid
+                                    # mask, the DFA is in an accept state. Write it
+                                    # and stop frontier growth.
+                                    x[0, frontier_pos] = chosen_token
+                                    num_frontier += 1
+                                    num_committed_step += 1
+                                    break
+
+                            # === PHASE 2: Confidence-ordered for remaining budget ===
+                            remaining_budget = number_transfer_tokens - num_committed_step
+                            if remaining_budget > 0:
+                                for k in range(number_transfer_tokens):
+                                    if num_committed_step >= number_transfer_tokens:
+                                        break
+                                    b_pos = transfer_index[0, k].item()
+                                    seq_pos = current_block_start + b_pos
+
+                                    # Skip if already committed in frontier phase
+                                    if seq_pos in _cd.mgr.committed:
+                                        continue
+                                    # Skip if not masked
+                                    if x[0, seq_pos].item() != mask_token_id:
+                                        continue
+
+                                    proposed_token = x_[0, b_pos].item()
+                                    if proposed_token == mask_token_id:
+                                        continue
+
+                                    left_seg = _cd._seg_ending_at(seq_pos - 1)
+                                    left_is_start = (seq_pos == _cd.mgr.gen_start)
+                                    is_constrained = left_seg is not None or left_is_start
+
+                                    if is_constrained:
+                                        num_constrained += 1
+                                        if _cd.is_valid_at_position(seq_pos, proposed_token):
+                                            x[0, seq_pos] = proposed_token
+                                            tok_bytes = _cd.t2b.get(proposed_token, b'')
+                                            if tok_bytes:
+                                                _cd.commit_token(seq_pos, proposed_token)
+                                            num_committed_step += 1
+                                        else:
+                                            valid_mask = _cd.get_valid_mask(
+                                                seq_pos, logits.device,
+                                                logits_vocab_size=logits.shape[-1]
+                                            )
+                                            if valid_mask is not None and valid_mask.any():
+                                                pos_logits = logits[0, b_pos].clone()
+                                                pos_logits[~valid_mask] = float('-inf')
+                                                if temperature > 0:
+                                                    probs = torch.softmax(
+                                                        pos_logits / temperature, dim=-1
+                                                    )
+                                                    chosen_token = torch.multinomial(probs, 1).item()
+                                                else:
+                                                    chosen_token = pos_logits.argmax().item()
+                                                x[0, seq_pos] = chosen_token
+                                                chosen_bytes = _cd.t2b.get(chosen_token, b'')
+                                                if chosen_bytes:
+                                                    _cd.commit_token(seq_pos, chosen_token)
+                                                num_committed_step += 1
+                                                num_resampled += 1
+                                    else:
+                                        tok_bytes = _cd.t2b.get(proposed_token, b'')
+                                        if not tok_bytes:
+                                            continue
+                                        num_unconstrained += 1
+                                        x[0, seq_pos] = proposed_token
+                                        _cd.commit_token(seq_pos, proposed_token)
+                                        num_committed_step += 1
 
                             t_cd_end = time.time()
 
-                            if _cd is not None:
-                                rej_str = f"({num_committed_step}ok/{num_rejected}rej"
-                                if num_unconstrained > 0:
-                                    rej_str += f"/{num_unconstrained}uncon"
-                                rej_str += ")"
-                                print(f"[CD-STEP] blk={num_block} step={i}/{steps_per_block}: "
-                                      f"model={t_model_end - t_model_start:.3f}s, "
-                                      f"cd={t_cd_end - t_cd_start:.4f}s "
-                                      f"{rej_str}, "
-                                      f"masked={num_masked_now}, xfer={number_transfer_tokens}, "
-                                      f"total_committed={_cd.mgr.num_committed}, "
-                                      f"segs={_cd.mgr.num_segments}",
-                                      flush=True)
-                                for diag in rejection_details:
-                                    tok_repr = diag['token_repr']
-                                    print(f"  [REJECT] pos={diag['position']} "
-                                          f"token={tok_repr} "
-                                          f"left={diag['left_seg'] or ('gen_start' if diag['left_is_start'] else 'NONE')} "
-                                          f"right={diag['right_seg'] or ('gen_end' if diag['right_is_end'] else 'NONE')} "
-                                          f"left_exits={diag['num_left_exits']} "
-                                          f"right_entries={diag['num_right_entries']} "
-                                          f"reason={diag['reason']}",
-                                          flush=True)
+                            parts = [f"{num_committed_step}ok"]
+                            if num_frontier > 0: parts.append(f"{num_frontier}front")
+                            if num_constrained > 0: parts.append(f"{num_constrained}cst")
+                            if num_resampled > 0: parts.append(f"{num_resampled}resamp")
+                            if num_unconstrained > 0: parts.append(f"{num_unconstrained}uncon")
+                            rej_str = "(" + "/".join(parts) + ")"
+                            print(f"[CD-STEP] blk={num_block} step={i}/{steps_per_block}: "
+                                f"model={t_model_end - t_model_start:.3f}s, "
+                                f"cd={t_cd_end - t_cd_start:.4f}s "
+                                f"{rej_str}, "
+                                f"masked={num_masked_now}, xfer={number_transfer_tokens}, "
+                                f"total_committed={_cd.mgr.num_committed}, "
+                                f"segs={_cd.mgr.num_segments}",
+                                flush=True)
                         else:
                             # No constraint — batch commit
                             row_indices = torch.arange(x.size(0), device=self.device).unsqueeze(1).expand_as(transfer_index)
@@ -542,6 +648,15 @@ class DreamGenerationMixin:
                 print(f"[CD-DONE] Unfilled mask positions ({len(mask_positions)}): "
                       f"{mask_positions[:20]}{'...' if len(mask_positions) > 20 else ''}",
                       flush=True)
+
+                # Replace remaining masks with EOS
+                eos_token_id = generation_config.eos_token_id
+                if eos_token_id is not None:
+                    if isinstance(eos_token_id, list):
+                        eos_token_id = eos_token_id[0]
+                    x[0, prompt_len:][x[0, prompt_len:] == mask_token_id] = eos_token_id
+                    print(f"[CD-DONE] Replaced {remaining_masks} masks with EOS (id={eos_token_id})",
+                          flush=True)
             # Check segment validity
             if total_segs > 0:
                 empty_segs = sum(1 for s in _cd.mgr._segments if len(s.pairs) == 0)

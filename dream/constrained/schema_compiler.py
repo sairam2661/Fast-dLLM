@@ -17,18 +17,24 @@ Supported schema features:
     or T_INTEGER/T_NUMBER; we use type constraints, not exact-value matching)
   - anyOf, oneOf
 
-Key ordering: powerset approach for required keys (2^n nonterminals).
-Falls back to lexicographic fixed order for n > 10.
+Key ordering: flat O(n) ambiguous grammar. Accepts any key in any order,
+over-accepts duplicates and missing required keys. Post-generation validation
+checks required-key presence and uniqueness. This is the right tradeoff:
+2^n powerset encoding made configs intractable (548K+ for 5 keys); the flat
+encoding keeps LR configs in the hundreds regardless of key count.
 
 Public API:
     key_strings, grammar = compile_schema(schema)
     # key_strings: list of property keys the scanner must distinguish
     # grammar: Grammar for BoundedLRAutomaton
+
+    required_keys = get_required_keys(schema)
+    # For post-generation validation of required-key presence
 """
 
 from __future__ import annotations
-from cfg import Grammar, Symbol, TERMINAL, NONTERMINAL
-from scanner import T_STRING, T_NUMBER, T_INTEGER, T_TRUE, T_FALSE, T_NULL, T_KEY_BASE
+from constrained.cfg import Grammar, Symbol, TERMINAL, NONTERMINAL
+from constrained.scanner import T_STRING, T_NUMBER, T_INTEGER, T_TRUE, T_FALSE, T_NULL, T_KEY_BASE
 
 # Structural byte terminals (used directly in grammar rules)
 _LB  = ord('{')
@@ -284,214 +290,68 @@ class _Compiler:
         return obj
 
     def _compile_members(self, required, optional, val_nts, allow_additional, hint) -> int:
-        n = len(required)
+        """
+        Flat O(n) members grammar. Accepts any key in any order, any number of times.
 
-        if n == 0:
-            return self._compile_opt_suffix(optional, val_nts, allow_additional, hint, first=True)
+        Grammar:
+            Members    → KeyValue | KeyValue COMMA Members
+            KeyValue   → KEY_k1 COLON V1 | KEY_k2 COLON V2 | ...
 
-        if n > 10:
-            return self._compile_members_fixed(
-                sorted(required), optional, val_nts, allow_additional, hint)
+        This is ambiguous (multiple derivations for any permutation, and it
+        over-accepts duplicate/missing keys), but for constrained decoding we
+        only need acceptance of structurally valid JSON with correct value types.
+        Required-key presence and uniqueness are checked post-generation.
 
-        # Powerset: nonterminal for each subset of remaining required keys
-        subset_nts: dict[frozenset, int] = {}
+        If additionalProperties is true, KeyValue also includes a generic
+        STRING COLON AnyValue alternative.
+        """
+        all_keys = list(required) + [k for k in optional if k not in required]
 
-        def get_sub_nt(rem: frozenset) -> int:
-            if rem in subset_nts:
-                return subset_nts[rem]
-            tag = "_".join(sorted(rem)) if rem else "done"
-            nt = self._nt(f"{hint}_req_{tag}")
-            subset_nts[rem] = nt
-            return nt
+        if not all_keys and not allow_additional:
+            # Empty object only: { }
+            empty = self._fresh(f"{hint}_empty_members")
+            self._rule(empty, [])
+            return empty
 
-        full = frozenset(required)
-
-        # Build rules bottom-up (empty set first).
-        # Comma placement: comma is a LEADING separator on each non-first key.
-        # req_{keys} nonterminals consume one key (with leading comma) and recur.
-        # Optional keys may appear interspersed: each req_{keys} state also has
-        # rules for optional keys (with leading comma), looping back to itself.
-        for size in range(len(required) + 1):
-            from itertools import combinations
-            for combo in combinations(sorted(required), size):
-                rem = frozenset(combo)
-                nt = get_sub_nt(rem)
-                if not rem:
-                    # All required seen: optional suffix (may be empty)
-                    opt = self._compile_opt_suffix(optional, val_nts, allow_additional, hint, first=False)
-                    self._rule(nt, [_NT(opt)])
-                else:
-                    # Consume one required key (with leading comma)
-                    for key in sorted(rem):
-                        rest_nt = get_sub_nt(rem - {key})
-                        kid = self._key_terminal.get(key)
-                        if kid is None:
-                            continue
-                        val_nt = val_nts[key]
-                        self._rule(nt, [_T(_COM), _T(kid), _T(_COL), _NT(val_nt), _NT(rest_nt)])
-                    # Also allow optional keys to appear before remaining required keys
-                    for key in optional:
-                        kid = self._key_terminal.get(key)
-                        if kid is None:
-                            continue
-                        val_nt = val_nts[key]
-                        # Optional key with leading comma, then continue with same required set
-                        self._rule(nt, [_T(_COM), _T(kid), _T(_COL), _NT(val_nt), _NT(nt)])
-
-        # First-entry wrapper: no leading comma before the first key.
-        # First key can be any required key OR any optional key.
-        first_nt = self._fresh(f"{hint}_members")
-        for key in sorted(full):
-            rest_nt = get_sub_nt(full - {key})
+        # KeyValue: one alternative per known key
+        kv = self._fresh(f"{hint}_kv")
+        for key in all_keys:
             kid = self._key_terminal.get(key)
             if kid is None:
                 continue
             val_nt = val_nts[key]
-            self._rule(first_nt, [_T(kid), _T(_COL), _NT(val_nt), _NT(rest_nt)])
-        # First key can also be an optional key
-        for key in optional:
-            kid = self._key_terminal.get(key)
-            if kid is None:
-                continue
-            val_nt = val_nts[key]
-            # After optional first key, still need all required keys (with leading commas)
-            self._rule(first_nt, [_T(kid), _T(_COL), _NT(val_nt), _NT(get_sub_nt(full))])
+            self._rule(kv, [_T(kid), _T(_COL), _NT(val_nt)])
 
-        return first_nt
+        if allow_additional is True:
+            any_key = self._ensure_any_key_nt()
+            any_val = self._ensure_any_value_nt()
+            self._rule(kv, [_NT(any_key), _T(_COL), _NT(any_val)])
+
+        # Members: right-recursive list of KeyValue separated by commas
+        # Members → KeyValue | KeyValue COMMA Members
+        members = self._fresh(f"{hint}_members")
+        self._rule(members, [_NT(kv)])
+        self._rule(members, [_NT(kv), _T(_COM), _NT(members)])
+
+        return members
 
     def _compile_opt_suffix(self, optional, val_nts, allow_additional, hint, first: bool) -> int:
         """
-        Nonterminal for the optional-key suffix after all required keys.
-
-        Uses a powerset over optional keys (2^k nonterminals) to avoid
-        right-recursive stack accumulation. Each nonterminal represents
-        the set of optional keys still available to appear.
-
-        With k optional keys, produces 2^k nonterminals each with at most
-        k+1 rules (one per remaining optional key + epsilon). No recursion,
-        so stack depth is bounded regardless of how many optional keys appear.
-
-        Falls back to recursive encoding if k > 10 (to keep grammar size bounded).
+        No longer used — flat encoding in _compile_members handles required +
+        optional keys uniformly. Kept as a no-op stub for any call sites that
+        may remain; returns an epsilon nonterminal.
         """
-        k = len(optional)
-
-        if k == 0:
-            # No optional keys: just epsilon (possibly with additionalProperties)
-            nt = self._fresh(f"{hint}_opt")
-            self._rule(nt, [])
-            if allow_additional is True:
-                any_key = self._ensure_any_key_nt()
-                any_val = self._ensure_any_value_nt()
-                # additionalProperties: allow generic kv pairs with comma separator
-                # Use a simple right-recursive rule here (additionalProperties is rare)
-                add_nt = self._fresh(f"{hint}_add")
-                self._rule(add_nt, [])
-                if first:
-                    self._rule(add_nt, [_NT(any_key), _T(_COL), _NT(any_val), _NT(add_nt)])
-                else:
-                    self._rule(add_nt, [_T(_COM), _NT(any_key), _T(_COL), _NT(any_val), _NT(add_nt)])
-                self._rule(nt, [_NT(add_nt)])
-            return nt
-
-        if k > 10:
-            # Fallback: right-recursive (may need deep stack, but rare)
-            return self._compile_opt_suffix_recursive(optional, val_nts, allow_additional, hint, first)
-
-        # Powerset: each state = frozenset of optional keys STILL AVAILABLE
-        # (not yet emitted). Start state = all optional keys available.
-        # At each state, can emit any available key (with comma prefix if non-first
-        # or if any required/optional key was already emitted), then transition
-        # to state with that key removed.
-        # Epsilon is always valid (end of optional section).
-
-        opt_nts: dict[frozenset, int] = {}
-
-        def get_opt_nt(available: frozenset, is_first_entry: bool) -> int:
-            cache_key = (available, is_first_entry)
-            if cache_key in opt_nts:
-                return opt_nts[cache_key]
-            tag = "_".join(sorted(available)) if available else "empty"
-            mode = "f" if is_first_entry else "nf"
-            nt = self._nt(f"{hint}_avail_{tag}_{mode}")
-            opt_nts[cache_key] = nt
-            return nt
-
-        # Build rules for all subsets, bottom-up
-        from itertools import combinations
-        all_subsets = []
-        for size in range(k + 1):
-            for combo in combinations(sorted(optional), size):
-                all_subsets.append(frozenset(combo))
-
-        for available in all_subsets:
-            for is_first_entry in [True, False]:
-                nt = get_opt_nt(available, is_first_entry)
-
-                # Epsilon: no more optional keys
-                self._rule(nt, [])
-
-                # Emit each available optional key
-                for key in sorted(available):
-                    kid = self._key_terminal.get(key)
-                    if kid is None:
-                        continue
-                    val_nt = val_nts[key]
-                    rest_nt = get_opt_nt(available - {key}, False)  # after emitting, never first again
-
-                    if is_first_entry:
-                        # First entry in object: no leading comma
-                        self._rule(nt, [_T(kid), _T(_COL), _NT(val_nt), _NT(rest_nt)])
-                    else:
-                        # Non-first: leading comma
-                        self._rule(nt, [_T(_COM), _T(kid), _T(_COL), _NT(val_nt), _NT(rest_nt)])
-
-                # additionalProperties (if allowed): keep simple for now, just epsilon
-                # Full additionalProperties support with powerset would be 2^k * additional
-                # We skip it here; it's not needed for additionalProperties: false schemas
-
-        return get_opt_nt(frozenset(optional), first)
-
-    def _compile_opt_suffix_recursive(self, optional, val_nts, allow_additional, hint, first: bool) -> int:
-        """Right-recursive fallback for large optional sets (k > 10)."""
-        nt = self._fresh(f"{hint}_opt_rec")
+        nt = self._fresh(f"{hint}_opt_stub")
         self._rule(nt, [])
-        for key in optional:
-            val_nt = val_nts[key]
-            kid = self._key_terminal.get(key)
-            if kid is None:
-                continue
-            if first:
-                self._rule(nt, [_T(kid), _T(_COL), _NT(val_nt), _NT(nt)])
-            else:
-                self._rule(nt, [_T(_COM), _T(kid), _T(_COL), _NT(val_nt), _NT(nt)])
-        return nt
-
-    def _ensure_any_key_nt(self) -> int:
-        if "AnyKey" in self._nt_idx:
-            return self._nt_idx["AnyKey"]
-        nt = self._nt("AnyKey")
-        self._rule(nt, [_T(T_STRING)])
-        for key in self._key_strings:
-            self._rule(nt, [_T(self._key_terminal[key])])
         return nt
 
     def _compile_members_fixed(self, required, optional, val_nts, allow_additional, hint) -> int:
-        """Fixed lexicographic order fallback for large required sets (n > 10)."""
-        nt = cur = self._fresh(f"{hint}_mfix")
-        for i, key in enumerate(required):
-            nxt = self._fresh(f"{hint}_af{i}")
-            kid = self._key_terminal.get(key)
-            val_nt = val_nts[key]
-            if i == 0:
-                # First key: no leading comma
-                self._rule(cur, [_T(kid), _T(_COL), _NT(val_nt), _NT(nxt)])
-            else:
-                # Subsequent keys: leading comma (cur is "rest after previous key")
-                self._rule(cur, [_T(_COM), _T(kid), _T(_COL), _NT(val_nt), _NT(nxt)])
-            cur = nxt
-        opt = self._compile_opt_suffix(optional, val_nts, allow_additional, hint, first=False)
-        self._rule(cur, [_NT(opt)])
-        return nt
+        """Unused — flat encoding replaces this. Delegates to _compile_members."""
+        return self._compile_members(required, optional, val_nts, allow_additional, hint)
+
+    def _compile_opt_suffix_recursive(self, optional, val_nts, allow_additional, hint, first: bool) -> int:
+        """Unused — flat encoding replaces this."""
+        return self._compile_opt_suffix(optional, val_nts, allow_additional, hint, first)
 
     # ------------------------------------------------------------------
     # Array
@@ -540,7 +400,11 @@ class _Compiler:
 # ---------------------------------------------------------------------------
 
 def _schema_stats(schema: dict) -> tuple[int, int]:
-    """Return (max_nesting_depth, max_optional_count_at_any_level)."""
+    """Return (max_nesting_depth, max_optional_count_at_any_level).
+    
+    With the flat encoding, optional count no longer affects depth,
+    but we keep it for informational purposes.
+    """
     if not isinstance(schema, dict):
         return 0, 0
     typ = schema.get("type")
@@ -568,13 +432,57 @@ def recommended_depth(schema: dict) -> int:
     """
     Compute the recommended BoundedLRAutomaton depth for a schema.
 
-    Formula: 4 * (max_nesting + max_optional + 2)
-    - max_nesting: maximum object-in-object depth
-    - max_optional: maximum number of optional properties at any object level
-    - +2 base accounts for structural rules and single-key objects
+    With the flat O(n) members grammar:
+      - Depth scales with nesting level, not key count or optional count.
+      - Formula: 4 * (2 * max_nesting + 2)
+        = 12 for nesting=1, 20 for nesting=2, 28 for nesting=3
+      - Empirically validated: covers schemas with up to 5 keys per level.
+
+    The +2 base accounts for the outer Object → { Members } structure.
+    The *2 multiplier on nesting accounts for the right-recursive Members
+    rule needing stack slots at each nesting level for both the outer
+    Object frame and the inner Members recursion.
     """
-    nesting, n_opt = _schema_stats(schema)
-    return 4 * (nesting + n_opt + 2)
+    nesting, _ = _schema_stats(schema)
+    return max(12, 4 * (2 * nesting + 2))
+
+
+def get_required_keys(schema: dict) -> dict[str, list[str]]:
+    """
+    Extract required keys at each nesting level for post-generation validation.
+
+    Returns a dict mapping a path string to a list of required key names.
+    The path "" is the top-level object.
+
+    Example:
+        {"type": "object", "properties": {"name": ..., "addr": {"type": "object",
+         "properties": {"city": ...}, "required": ["city"]}},
+         "required": ["name", "addr"]}
+        → {"": ["name", "addr"], "addr": ["city"]}
+
+    Used by the eval script to check required-key presence after generation,
+    since the flat grammar over-accepts (allows missing required keys).
+    """
+    result: dict[str, list[str]] = {}
+
+    def walk(s, path):
+        if not isinstance(s, dict):
+            return
+        if s.get("type") == "object":
+            req = s.get("required", [])
+            if req:
+                result[path] = list(req)
+            for key, val_schema in s.get("properties", {}).items():
+                child_path = f"{path}.{key}" if path else key
+                walk(val_schema, child_path)
+        elif s.get("type") == "array":
+            walk(s.get("items", {}), path)
+        for k in ("anyOf", "oneOf"):
+            for alt in s.get(k, []):
+                walk(alt, path)
+
+    walk(schema, "")
+    return result
 
 
 def compile_schema(schema: dict) -> tuple[list[str], Grammar]:
@@ -586,6 +494,10 @@ def compile_schema(schema: dict) -> tuple[list[str], Grammar]:
         - key_strings: ordered list of property keys the scanner must distinguish.
                        key_strings[i] maps to terminal T_KEY_BASE + i.
         - grammar: Grammar suitable for BoundedLRAutomaton.
+
+    The grammar accepts any key in any order and over-accepts (allows missing
+    required keys, duplicate keys). Use get_required_keys(schema) to validate
+    required-key presence post-generation.
 
     Usage:
         key_strings, grammar = compile_schema(schema)

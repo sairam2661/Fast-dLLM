@@ -84,6 +84,13 @@ class Segment:
         """All possible exit configs for this segment."""
         return frozenset(x for _, x in self.pairs)
 
+    # Backward-compat aliases (DFA version used _states suffix)
+    def entry_states(self) -> frozenset[int]:
+        return self.entry_configs()
+
+    def exit_states(self) -> frozenset[int]:
+        return self.exit_configs()
+
     def exits_for_entry(self, entry: int) -> frozenset[int]:
         """Exit configs reachable from a specific entry config."""
         return frozenset(x for e, x in self.pairs if e == entry)

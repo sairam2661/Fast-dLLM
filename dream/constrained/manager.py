@@ -302,7 +302,7 @@ class SegmentManager:
                 # Leftmost segment: only pairs entered from the canonical start state
                 start = self.automaton.start_state
                 return frozenset(x for e, x in seg.pairs if e == start)
-            return seg.exit_states()
+            return seg.exit_configs()
         elif position == self.gen_start:
             return frozenset({self.automaton.start_state})
         else:
@@ -316,7 +316,7 @@ class SegmentManager:
                 # Rightmost segment: only pairs that exit into an accept state
                 accepts = self.automaton.accept_states
                 return frozenset(e for e, x in seg.pairs if x in accepts)
-            return seg.entry_states()
+            return seg.entry_configs()
         elif position == self.gen_end:
             return self.automaton.accept_states
         else:

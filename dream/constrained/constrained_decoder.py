@@ -130,7 +130,7 @@ class ConstrainedDecoder:
             if seg.start <= self.mgr.gen_start:
                 start = self.automaton.start_state
                 return frozenset(x for e, x in seg.pairs if e == start)
-            return seg.exit_states()
+            return seg.exit_configs()
         elif position == self.mgr.gen_start:
             return frozenset({self.automaton.start_state})
         else:
@@ -142,7 +142,7 @@ class ConstrainedDecoder:
             if seg.end >= self.mgr.gen_end:
                 accepts = self.automaton.accept_states
                 return frozenset(e for e, x in seg.pairs if x in accepts)
-            return seg.entry_states()
+            return seg.entry_configs()
         elif position == self.mgr.gen_end:
             return self.automaton.accept_states
         else:
@@ -172,7 +172,7 @@ class ConstrainedDecoder:
         if main_seg.start <= self.mgr.gen_start:
             exit_composites = frozenset(x for e, x in main_seg.pairs if e == start)
         else:
-            exit_composites = main_seg.exit_states()
+            exit_composites = main_seg.exit_configs()
 
         if not exit_composites:
             return None
@@ -395,8 +395,11 @@ class ConstrainedDecoder:
                 mask[self.mask_token_id] = True
             return mask
 
-        # FAST PATH: union precomputed per-state masks (no right constraint)
-        if effective_right is None and self._state_mask_cache:
+        # FAST PATH: union per-composite masks (lazy: computed on first miss, cached thereafter).
+        # This handles both constrained and unconstrained cases.
+        # For the LR backend, _get_precomputed_state_mask does a trie walk on first call
+        # (~20ms for 150K vocab) then caches. Only ~33 unique composites appear per generation.
+        if effective_right is None:
             mask = None
             for state in left_exits:
                 state_mask = self._get_precomputed_state_mask(state, device, logits_vocab_size)
@@ -406,56 +409,39 @@ class ConstrainedDecoder:
                 self._mask_cache[position] = mask
                 return mask
 
-        # RIGHT-CONSTRAINED FAST PATH: union then re-filter
-        if effective_right is not None and len(left_exits) <= 20 and self._state_mask_cache:
-            union_mask = None
-            for state in left_exits:
-                sm = self._get_precomputed_state_mask(state, device, logits_vocab_size)
-                union_mask = sm.clone() if union_mask is None else union_mask.logical_or_(sm)
+        # RIGHT-CONSTRAINED PATH: union masks then re-filter against right_entries.
+        # Use per-composite masks (lazy computed) as an over-approximation,
+        # then verify each candidate token reaches right_entries.
+        union_mask = None
+        for state in left_exits:
+            sm = self._get_precomputed_state_mask(state, device, logits_vocab_size)
+            union_mask = sm.clone() if union_mask is None else union_mask.logical_or_(sm)
 
-            if union_mask is not None:
-                candidate_indices = union_mask.nonzero(as_tuple=True)[0]
-                size = max(self.trie.vocab_size, logits_vocab_size)
-                mask = torch.zeros(size, dtype=torch.bool, device=device)
+        if union_mask is not None and len(left_exits) <= 20:
+            # Small exit set: exact re-filter
+            candidate_indices = union_mask.nonzero(as_tuple=True)[0]
+            size = max(self.trie.vocab_size, logits_vocab_size)
+            mask = torch.zeros(size, dtype=torch.bool, device=device)
+            for idx in candidate_indices:
+                tid = idx.item()
+                tok_bytes = self.t2b.get(tid, b'')
+                if not tok_bytes:
+                    continue
+                for q in left_exits:
+                    result = self.automaton.transition_seq(q, tok_bytes)
+                    hits = result if isinstance(result, frozenset) else (
+                        frozenset() if result == -1 else frozenset({result})
+                    )
+                    if hits & effective_right:
+                        mask[tid] = True
+                        break
+        elif union_mask is not None:
+            # Large exit set: use union as over-approximation (avoids O(V×|exits|) scan)
+            mask = union_mask
+        else:
+            size = max(self.trie.vocab_size, logits_vocab_size)
+            mask = torch.zeros(size, dtype=torch.bool, device=device)
 
-                for idx in candidate_indices:
-                    tid = idx.item()
-                    tok_bytes = self.t2b.get(tid, b'')
-                    if not tok_bytes:
-                        continue
-                    for q in left_exits:
-                        result = self.automaton.transition_seq(q, tok_bytes)
-                        hits = result if isinstance(result, frozenset) else (
-                            frozenset() if result == -1 else frozenset({result})
-                        )
-                        if hits & effective_right:
-                            mask[tid] = True
-                            break
-
-                mask = _mark_eos_valid(mask)
-                self._mask_cache[position] = mask
-                return mask
-
-        # LARGE EXIT SET WITH RIGHT CONSTRAINT: union mask as over-approx
-        if effective_right is not None and len(left_exits) > 20 and self._state_mask_cache:
-            mask = None
-            for state in left_exits:
-                sm = self._get_precomputed_state_mask(state, device, logits_vocab_size)
-                mask = sm.clone() if mask is None else mask.logical_or_(sm)
-            if mask is not None:
-                mask = _mark_eos_valid(mask)
-                self._mask_cache[position] = mask
-                return mask
-
-        # FALLBACK: trie traversal
-        valid_set = self.trie.compute_valid_set(
-            left_exits, effective_right, self.automaton
-        )
-        size = max(self.trie.vocab_size, logits_vocab_size)
-        mask = torch.zeros(size, dtype=torch.bool, device=device)
-        if valid_set:
-            indices = torch.tensor(list(valid_set), dtype=torch.long, device=device)
-            mask[indices] = True
         mask = _mark_eos_valid(mask)
         self._mask_cache[position] = mask
         return mask
@@ -510,11 +496,13 @@ class ConstrainedDecoder:
         """
         Precompute per-composite-state valid token masks.
 
-        For the composite (scanner+LR) backend, iterates over all reachable
-        composite states and computes which tokens are valid from each.
+        For the LR backend: this is intentionally a no-op. Masks are computed
+        lazily on first query via _get_precomputed_state_mask (trie walk, ~20ms
+        per composite at 150K vocab). Only ~33 unique composites are ever queried
+        during a 256-token generation, so lazy compute costs ~0.7s total vs hours
+        for upfront precomputation of all composites.
 
-        For the legacy DFA backend, iterates over DFA states using the
-        vectorized numpy approach.
+        For the legacy DFA backend: uses fast vectorized numpy precomputation.
         """
         import time
         t0 = time.time()
@@ -524,31 +512,11 @@ class ConstrainedDecoder:
             self._precompute_dfa_masks(device, logits_vocab_size, composites)
             return
 
-        # Composite path: use trie traversal per composite state
-        all_composites = composites if composites is not None else set(self.automaton.all_configs())
-        vocab_size = max(self.trie.vocab_size, logits_vocab_size)
-
-        print(f"  [precompute] {len(all_composites)} composite states, vocab={vocab_size}", flush=True)
-
-        for count, composite in enumerate(sorted(all_composites)):
-            valid = self.trie.compute_valid_set(
-                frozenset({composite}), None, self.automaton
-            )
-            mask = torch.zeros(vocab_size, dtype=torch.bool, device=device)
-            for tid in valid:
-                if tid < vocab_size:
-                    mask[tid] = True
-            self._state_mask_cache[(composite, device)] = mask
-
-            if (count + 1) % 1000 == 0:
-                elapsed = time.time() - t0
-                rate = (count + 1) / elapsed
-                remaining = (len(all_composites) - count - 1) / rate
-                print(f"  [precompute] {count+1}/{len(all_composites)} "
-                      f"({elapsed:.1f}s, ~{remaining:.0f}s left)", flush=True)
-
-        print(f"  [precompute] Done: {len(all_composites)} masks in "
-              f"{time.time()-t0:.1f}s", flush=True)
+        # LR backend: no-op. Lazy compute handles it.
+        print(f"  [precompute] LR backend: lazy mode (masks computed on demand per composite)",
+              flush=True)
+        print(f"  [precompute] {self.automaton.num_states} total composites; "
+              f"~30-50 will be computed lazily during generation", flush=True)
 
     def _precompute_dfa_masks(
         self, device: torch.device, logits_vocab_size: int, states
